@@ -1,4 +1,4 @@
-CFLAGS = -std=c89 -Wpedantic -D_POSIX_C_SOURCE=200809L -Wall -Wextra `pkg-config --cflags libpq`
+CFLAGS = -std=c99 -Wpedantic -D_POSIX_C_SOURCE=200809L -Wall -Wextra -O2 `pkg-config --cflags libpq`
 LDFLAGS = `pkg-config --libs libpq`
 
 default: pg_listen
