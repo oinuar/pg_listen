@@ -7,219 +7,247 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
 
-void		listen_forever(PGconn *, const char *, const char *, char **);
-int			reset_if_necessary(PGconn *);
-void		clean_and_die(PGconn *);
-void		begin_listen(PGconn *, const char *);
-int			print_log(const char *, const char *,...);
-int			exec_pipe(const char *cmd, char **cmd_argv, const char *input);
+void listen_forever(PGconn *, const char *, const char *, char **);
+int reset_if_necessary(PGconn *);
+void begin_listen(PGconn *, const char *);
+int print_log(const char *, const char *, ...);
+int exec_pipe(const char *cmd, char **cmd_argv, const char *input);
 
-#define		BUFSZ 512
+#define BUFSZ 512
 
-int
-main(int argc, char **argv)
+static PGconn *connection = NULL;
+static char *channel = NULL;
+
+void clean_and_exit(int exit_code)
 {
-	PGconn	   *conn;
-	char	   *chan;
+   if (channel != NULL)
+      PQfreemem(channel);
 
-	if (argc < 3)
-	{
-		fprintf(stderr,
-				"USAGE: %s db-url channel [/path/to/program] [args]\n",
-				argv[0]);
-		return EXIT_FAILURE;
-	}
+   if (connection != NULL)
+      PQfinish(connection);
 
-	/* if no command given, print payload with line buffering */
-	if (argc == 3)
-		setvbuf(stdout, NULL, _IOLBF, 0);
-
-	conn = PQconnectdb(argv[1]);
-	if (PQstatus(conn) != CONNECTION_OK)
-	{
-		print_log("CRITICAL", PQerrorMessage(conn));
-		clean_and_die(conn);
-	}
-
-	chan = PQescapeIdentifier(conn, argv[2], BUFSZ);
-	if (chan == NULL)
-	{
-		print_log("CRITICAL", PQerrorMessage(conn));
-		clean_and_die(conn);
-	}
-
-	/* safe since argv[argc] == NULL by C99 5.1.2.2.1 */
-	listen_forever(conn, chan, argv[3], argv + 3);
-
-	/* should never get here */
-	PQfreemem(chan);
-	PQfinish(conn);
-	return EXIT_SUCCESS;
+   wait(NULL); /* Wait for all forked childs. */
+   exit(exit_code);
 }
 
-int
-exec_pipe(const char *cmd, char **cmd_argv, const char *input)
+void sig_handler(int signum, siginfo_t *info, void *context)
 {
-	int			pipefds[2];
-
-	/* we'll send "input" through pipe to stdin */
-	if (errno = 0, pipe(pipefds) < 0)
-	{
-		print_log("ERROR", "pipe(): %s", strerror(errno));
-		return 0;
-	}
-
-	switch (errno = 0, fork())
-	{
-		case -1:
-			print_log("ERROR", "fork(): %s", strerror(errno));
-			close(pipefds[0]);
-			close(pipefds[1]);
-			return 0;
-		case 0:					/* Child - reads from pipe */
-			/* Write end is unused */
-			close(pipefds[1]);
-			/* read from pipe as stdin */
-			if (errno = 0, dup2(pipefds[0], STDIN_FILENO) < 0)
-			{
-				print_log("ERROR",
-						  "Unable to assign stdin to pipe: %s",
-						  strerror(errno));
-				close(pipefds[0]);
-				exit(EXIT_FAILURE);
-			}
-			if (errno = 0, execv(cmd, cmd_argv) < 0)
-			{
-				print_log("ERROR", "execv(%s): %s",
-						  cmd, strerror(errno));
-				close(pipefds[0]);
-				exit(EXIT_FAILURE);
-			}
-			/* should not get here */
-			break;
-		default:				/* Parent - writes to pipe */
-			close(pipefds[0]);	/* Read end is unused */
-			write(pipefds[1], input, strlen(input));
-			close(pipefds[1]);
-			break;
-	}
-	return 1;
+   if (signum == SIGTERM || signum == SIGINT)
+   {
+      print_log("INFO", "Received exit signal.");
+      clean_and_exit(EXIT_SUCCESS);
+   }
 }
 
-void
-listen_forever(PGconn *conn, const char *chan, const char *cmd, char **cmd_argv)
+int main(int argc, char **argv)
 {
-	int			sock;
-	PGnotify   *notify;
-	struct pollfd pfd[1];
+   struct sigaction sigact;
 
-	begin_listen(conn, chan);
+   if (argc < 3)
+   {
+      fprintf(stderr,
+              "USAGE: %s postgresql://user:password@db-url:port channel [/path/to/program] [args]\n",
+              argv[0]);
 
-	while (1)
-	{
-		if (reset_if_necessary(conn))
-			begin_listen(conn, chan);
+      return EXIT_FAILURE;
+   }
 
-		sock = PQsocket(conn);
-		if (sock < 0)
-		{
-			print_log("CRITICAL",
-					  "Failed to get libpq socket: %s\n",
-					  PQerrorMessage(conn));
-			clean_and_die(conn);
-		}
+   memset(&sigact, 0, sizeof(sigact));
+   sigact.sa_sigaction = sig_handler;
 
-		pfd[0].fd = sock;
-		pfd[0].events = POLLIN;
-		if (errno = 0, poll(pfd, 1, -1) < 0)
-		{
-			print_log("CRITICAL", "poll(): %s", strerror(errno));
-			clean_and_die(conn);
-		}
+   if (sigaction(SIGTERM, &sigact, NULL) != sigaction(SIGINT, &sigact, NULL) != 0)
+   {
+      print_log("CRITICAL", "Cannot register SIGTERM and SIGINT handlers.");
+      return EXIT_FAILURE;
+   }
 
-		PQconsumeInput(conn);
-		while ((notify = PQnotifies(conn)) != NULL)
-		{
-			if (!cmd)
-				fputs(notify->extra, stdout);
-			else if (!exec_pipe(cmd, cmd_argv, notify->extra))
-			{
-				PQfreemem(notify);
-				clean_and_die(conn);
-			}
+   /* if no command given, print payload with line buffering */
+   if (argc == 3)
+      setvbuf(stdout, NULL, _IOLBF, 0);
 
-			PQfreemem(notify);
-		}
-	}
+   connection = PQconnectdb(argv[1]);
+
+   if (PQstatus(connection) != CONNECTION_OK)
+   {
+      print_log("CRITICAL", PQerrorMessage(connection));
+      clean_and_exit(EXIT_FAILURE);
+   }
+
+   channel = PQescapeIdentifier(connection, argv[2], BUFSZ);
+
+   if (channel == NULL)
+   {
+      print_log("CRITICAL", PQerrorMessage(connection));
+      clean_and_exit(EXIT_FAILURE);
+   }
+
+   /* safe since argv[argc] == NULL by C99 5.1.2.2.1 */
+   listen_forever(connection, channel, argv[3], argv + 3);
+
+   return EXIT_SUCCESS;
 }
 
-int
-reset_if_necessary(PGconn *conn)
+int exec_pipe(const char *cmd, char **cmd_argv, const char *input)
 {
-	unsigned int seconds = 0;
+   int pipefds[2];
 
-	if (PQstatus(conn) == CONNECTION_OK)
-		return 0;
+   /* we'll send "input" through pipe to stdin */
+   if (errno = 0, pipe(pipefds) < 0)
+   {
+      print_log("ERROR", "pipe2(): %s", strerror(errno));
+      return 0;
+   }
 
-	do
-	{
-		if (seconds == 0)
-			seconds = 1;
-		else
-		{
-			print_log("ERROR", "Connection failed.\nSleeping %u seconds.", seconds);
-			sleep(seconds);
-			seconds *= 2;
-		}
-		print_log("INFO", "Reconnecting to database...");
-		PQreset(conn);
-	} while (PQstatus(conn) != CONNECTION_OK);
+   switch (errno = 0, fork())
+   {
+   case -1:
+      print_log("ERROR", "fork(): %s", strerror(errno));
+      close(pipefds[0]);
+      close(pipefds[1]);
+      return 0;
 
-	return 1;
+   case 0: /* Child - reads from pipe */
+      /* Write end is unused */
+      close(pipefds[1]);
+      /* read from pipe as stdin */
+      if (errno = 0, dup2(pipefds[0], STDIN_FILENO) < 0)
+      {
+         print_log("ERROR",
+                   "Unable to assign stdin to pipe: %s",
+                   strerror(errno));
+         close(pipefds[0]);
+         exit(EXIT_FAILURE);
+      }
+
+      if (errno = 0, execv(cmd, cmd_argv) < 0)
+      {
+         print_log("ERROR", "execv(%s): %s",
+                   cmd, strerror(errno));
+         close(pipefds[0]);
+         clean_and_exit(EXIT_FAILURE);
+      }
+      /* should not get here */
+      break;
+
+   default:              /* Parent - writes to pipe */
+      close(pipefds[0]); /* Read end is unused */
+      write(pipefds[1], input, strlen(input));
+      close(pipefds[1]);
+      break;
+   }
+
+   return 1;
 }
 
-void
-begin_listen(PGconn *conn, const char *chan)
+void listen_forever(PGconn *conn, const char *chan, const char *cmd, char **cmd_argv)
 {
-	PGresult   *res;
-	char		sql[7 + BUFSZ + 1];
+   int sock;
+   PGnotify *notify;
+   struct pollfd pfd[1];
 
-	print_log("INFO", "Listening on channel %s", chan);
+   begin_listen(conn, chan);
 
-	snprintf(sql, 7 + BUFSZ + 1, "LISTEN %s", chan);
-	res = PQexec(conn, sql);
+   for (;;)
+   {
+      if (reset_if_necessary(conn))
+         begin_listen(conn, chan);
 
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-	{
-		print_log("CRITICAL", "LISTEN command failed: %s", PQerrorMessage(conn));
-		PQclear(res);
-		clean_and_die(conn);
-	}
-	PQclear(res);
+      sock = PQsocket(conn);
+      if (sock < 0)
+      {
+         print_log("CRITICAL",
+                   "Failed to get libpq socket: %s\n",
+                   PQerrorMessage(conn));
+         clean_and_exit(EXIT_FAILURE);
+      }
+
+      pfd[0].fd = sock;
+      pfd[0].events = POLLIN;
+      if (errno = 0, poll(pfd, 1, -1) < 0)
+      {
+         print_log("CRITICAL", "poll(): %s", strerror(errno));
+         clean_and_exit(EXIT_FAILURE);
+      }
+
+      PQconsumeInput(conn);
+
+      while ((notify = PQnotifies(conn)) != NULL)
+      {
+         if (!cmd) {
+            fputs(notify->extra, stdout);
+            fflush(stdout);
+         }
+
+         else if (!exec_pipe(cmd, cmd_argv, notify->extra))
+         {
+            PQfreemem(notify);
+            clean_and_exit(EXIT_FAILURE);
+         }
+
+         PQfreemem(notify);
+      }
+   }
 }
 
-void
-clean_and_die(PGconn *conn)
+int reset_if_necessary(PGconn *conn)
 {
-	PQfinish(conn);
-	exit(EXIT_FAILURE);
+   unsigned int seconds = 0;
+
+   if (PQstatus(conn) == CONNECTION_OK)
+      return 0;
+
+   do
+   {
+      if (seconds == 0)
+         seconds = 1;
+      else
+      {
+         print_log("ERROR", "Connection failed.\nSleeping %u seconds.", seconds);
+         sleep(seconds);
+         seconds *= 2;
+      }
+      print_log("INFO", "Reconnecting to database...");
+      PQreset(conn);
+   } while (PQstatus(conn) != CONNECTION_OK);
+
+   return 1;
 }
 
-int
-print_log(const char *sev, const char *fmt,...)
+void begin_listen(PGconn *conn, const char *chan)
 {
-	va_list		ap;
-	time_t		now = time(NULL);
-	char		timestamp[128];
-	int			res;
+   PGresult *res;
+   char sql[7 + BUFSZ + 1];
 
-	strftime(timestamp, sizeof timestamp, "%Y-%m-%dT%H:%M:%S", gmtime(&now));
-	res = fprintf(stderr, "%s - pg_listen - %s - ", timestamp, sev);
+   print_log("INFO", "Listening on channel %s", chan);
 
-	va_start(ap, fmt);
-	res += vfprintf(stderr, fmt, ap);
-	va_end(ap);
+   snprintf(sql, 7 + BUFSZ + 1, "LISTEN %s", chan);
+   res = PQexec(conn, sql);
 
-	return res + fprintf(stderr, "\n");
+   if (PQresultStatus(res) != PGRES_COMMAND_OK)
+   {
+      print_log("CRITICAL", "LISTEN command failed: %s", PQerrorMessage(conn));
+      PQclear(res);
+      clean_and_exit(EXIT_FAILURE);
+   }
+   PQclear(res);
+}
+
+int print_log(const char *sev, const char *fmt, ...)
+{
+   va_list ap;
+   time_t now = time(NULL);
+   char timestamp[128];
+   int res;
+
+   strftime(timestamp, sizeof timestamp, "%Y-%m-%dT%H:%M:%S", gmtime(&now));
+   res = fprintf(stderr, "%s - pg_listen - %s - ", timestamp, sev);
+
+   va_start(ap, fmt);
+   res += vfprintf(stderr, fmt, ap);
+   va_end(ap);
+
+   return res + fprintf(stderr, "\n");
 }
