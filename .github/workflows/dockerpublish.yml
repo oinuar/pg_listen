@@ -13,7 +13,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Use Docker Buildx
+      - name: Checkout
+        uses: actions/checkout@v1
+
+      - name: Setup Docker Buildx
         uses: crazy-max/ghaction-docker-buildx@v1.3.0
         with:
           version: latest
@@ -44,5 +47,4 @@ jobs:
             -t $IMAGE_ID:$VERSION \
             --platform linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/ppc64le,linux/s390x \
             --push \
-            --file Dockerfile \
             . 
