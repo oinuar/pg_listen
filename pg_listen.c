@@ -219,7 +219,7 @@ int main(int argc, char **argv)
    memset(&sigact, 0, sizeof(sigact));
    sigact.sa_sigaction = sig_handler;
 
-   if (sigaction(SIGTERM, &sigact, NULL) != sigaction(SIGINT, &sigact, NULL) != 0)
+   if (sigaction(SIGTERM, &sigact, NULL) != 0 || sigaction(SIGINT, &sigact, NULL) != 0)
    {
       print_log("CRITICAL", "Cannot register SIGTERM and SIGINT handlers.");
       return EXIT_FAILURE;
