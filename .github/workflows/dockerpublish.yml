@@ -22,11 +22,11 @@ jobs:
           version: latest
          
       - name: Log into registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login docker.pkg.github.com -u ${{ github.actor }} --password-stdin
+        run: echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u ${{ github.actor }} --password-stdin
 
       - name: Build and push multiplatform Docker images
         run: |
-          IMAGE_ID=docker.pkg.github.com/${{ github.repository }}
+          IMAGE_ID=${{ github.repository }}
           
           # Change all uppercase to lowercase
           IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
