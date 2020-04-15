@@ -23,7 +23,7 @@ jobs:
 
       - name: Build and push multiplatform Docker images
         run: |
-          IMAGE_ID=docker.pkg.github.com/${{ github.repository }}/pg_listen
+          IMAGE_ID=docker.pkg.github.com/${{ github.repository }}
           
           # Change all uppercase to lowercase
           IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
@@ -41,7 +41,7 @@ jobs:
           echo VERSION=$VERSION
           
           docker buildx build \
-            -t $IMAGE_ID:$VERSION
+            -t $IMAGE_ID:$VERSION \
             --platform linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/ppc64le,linux/s390x \
             --push \
             . 
