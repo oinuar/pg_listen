@@ -1,11 +1,21 @@
-FROM haamutech/cmake-llvm:latest
+FROM alpine:3.11.5 as base
 
-RUN apt-get update && apt-get install --no-install-recommends -y libpq-dev pkg-config && apt-get clean
+RUN apk add --no-cache libpq
 
-WORKDIR /app
 
-COPY . .
+FROM base as build
+
+RUN apk add --no-cache gcc make pkgconfig postgresql-dev musl-dev
+
+WORKDIR /src
+
+COPY . . 
 
 RUN make
 
-ENTRYPOINT ["/app/pg_listen"]
+
+FROM base
+
+COPY --from=build /src/pg_listen /usr/local/bin/
+
+ENTRYPOINT [ "pg_listen" ]

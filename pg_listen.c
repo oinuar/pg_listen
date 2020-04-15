@@ -10,12 +10,6 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-void listen_forever(PGconn *, const char *, const char *, char **);
-int reset_if_necessary(PGconn *);
-void begin_listen(PGconn *, const char *);
-int print_log(const char *, const char *, ...);
-int exec_pipe(const char *cmd, char **cmd_argv, const char *input);
-
 #define BUFSZ 512
 
 static PGconn *connection = NULL;
@@ -33,61 +27,33 @@ void clean_and_exit(int exit_code)
    exit(exit_code);
 }
 
+int print_log(const char *sev, const char *fmt, ...)
+{
+   va_list ap;
+   time_t now = time(NULL);
+   char timestamp[128];
+   int res;
+
+   strftime(timestamp, sizeof timestamp, "%Y-%m-%dT%H:%M:%S", gmtime(&now));
+   res = fprintf(stderr, "%s - pg_listen - %s - ", timestamp, sev);
+
+   va_start(ap, fmt);
+   res += vfprintf(stderr, fmt, ap);
+   va_end(ap);
+
+   return res + fprintf(stderr, "\n");
+}
+
 void sig_handler(int signum, siginfo_t *info, void *context)
 {
+   (void)info;
+   (void)context;
+
    if (signum == SIGTERM || signum == SIGINT)
    {
       print_log("INFO", "Received exit signal.");
       clean_and_exit(EXIT_SUCCESS);
    }
-}
-
-int main(int argc, char **argv)
-{
-   struct sigaction sigact;
-
-   if (argc < 3)
-   {
-      fprintf(stderr,
-              "USAGE: %s postgresql://user:password@db-url:port channel [/path/to/program] [args]\n",
-              argv[0]);
-
-      return EXIT_FAILURE;
-   }
-
-   memset(&sigact, 0, sizeof(sigact));
-   sigact.sa_sigaction = sig_handler;
-
-   if (sigaction(SIGTERM, &sigact, NULL) != sigaction(SIGINT, &sigact, NULL) != 0)
-   {
-      print_log("CRITICAL", "Cannot register SIGTERM and SIGINT handlers.");
-      return EXIT_FAILURE;
-   }
-
-   /* if no command given, print payload with line buffering */
-   if (argc == 3)
-      setvbuf(stdout, NULL, _IOLBF, 0);
-
-   connection = PQconnectdb(argv[1]);
-
-   if (PQstatus(connection) != CONNECTION_OK)
-   {
-      print_log("CRITICAL", PQerrorMessage(connection));
-      clean_and_exit(EXIT_FAILURE);
-   }
-
-   channel = PQescapeIdentifier(connection, argv[2], BUFSZ);
-
-   if (channel == NULL)
-   {
-      print_log("CRITICAL", PQerrorMessage(connection));
-      clean_and_exit(EXIT_FAILURE);
-   }
-
-   /* safe since argv[argc] == NULL by C99 5.1.2.2.1 */
-   listen_forever(connection, channel, argv[3], argv + 3);
-
-   return EXIT_SUCCESS;
 }
 
 int exec_pipe(const char *cmd, char **cmd_argv, const char *input)
@@ -142,6 +108,51 @@ int exec_pipe(const char *cmd, char **cmd_argv, const char *input)
    return 1;
 }
 
+int reset_if_necessary(PGconn *conn)
+{
+   unsigned int seconds = 0;
+
+   if (PQstatus(conn) == CONNECTION_OK)
+      return 0;
+
+   do
+   {
+      if (seconds == 0)
+         seconds = 1;
+      else
+      {
+         print_log("ERROR", "Connection failed.\nSleeping %u seconds.", seconds);
+         sleep(seconds);
+         seconds *= 2;
+      }
+
+      print_log("INFO", "Reconnecting to database...");
+      PQreset(conn);
+   } while (PQstatus(conn) != CONNECTION_OK);
+
+   return 1;
+}
+
+void begin_listen(PGconn *conn, const char *chan)
+{
+   PGresult *res;
+   char sql[7 + BUFSZ + 1];
+
+   print_log("INFO", "Listening on channel %s", chan);
+
+   snprintf(sql, 7 + BUFSZ + 1, "LISTEN %s", chan);
+   res = PQexec(conn, sql);
+
+   if (PQresultStatus(res) != PGRES_COMMAND_OK)
+   {
+      print_log("CRITICAL", "LISTEN command failed: %s", PQerrorMessage(conn));
+      PQclear(res);
+      clean_and_exit(EXIT_FAILURE);
+   }
+
+   PQclear(res);
+}
+
 void listen_forever(PGconn *conn, const char *chan, const char *cmd, char **cmd_argv)
 {
    int sock;
@@ -192,62 +203,46 @@ void listen_forever(PGconn *conn, const char *chan, const char *cmd, char **cmd_
    }
 }
 
-int reset_if_necessary(PGconn *conn)
+int main(int argc, char **argv)
 {
-   unsigned int seconds = 0;
+   struct sigaction sigact;
 
-   if (PQstatus(conn) == CONNECTION_OK)
-      return 0;
-
-   do
+   if (argc < 3)
    {
-      if (seconds == 0)
-         seconds = 1;
-      else
-      {
-         print_log("ERROR", "Connection failed.\nSleeping %u seconds.", seconds);
-         sleep(seconds);
-         seconds *= 2;
-      }
-      print_log("INFO", "Reconnecting to database...");
-      PQreset(conn);
-   } while (PQstatus(conn) != CONNECTION_OK);
+      fprintf(stderr,
+              "USAGE: %s postgresql://user:password@db-url:port channel [/path/to/program] [args]\n",
+              argv[0]);
 
-   return 1;
-}
+      return EXIT_FAILURE;
+   }
 
-void begin_listen(PGconn *conn, const char *chan)
-{
-   PGresult *res;
-   char sql[7 + BUFSZ + 1];
+   memset(&sigact, 0, sizeof(sigact));
+   sigact.sa_sigaction = sig_handler;
 
-   print_log("INFO", "Listening on channel %s", chan);
-
-   snprintf(sql, 7 + BUFSZ + 1, "LISTEN %s", chan);
-   res = PQexec(conn, sql);
-
-   if (PQresultStatus(res) != PGRES_COMMAND_OK)
+   if (sigaction(SIGTERM, &sigact, NULL) != sigaction(SIGINT, &sigact, NULL) != 0)
    {
-      print_log("CRITICAL", "LISTEN command failed: %s", PQerrorMessage(conn));
-      PQclear(res);
+      print_log("CRITICAL", "Cannot register SIGTERM and SIGINT handlers.");
+      return EXIT_FAILURE;
+   }
+
+   connection = PQconnectdb(argv[1]);
+
+   if (PQstatus(connection) != CONNECTION_OK)
+   {
+      print_log("CRITICAL", PQerrorMessage(connection));
       clean_and_exit(EXIT_FAILURE);
    }
-   PQclear(res);
-}
 
-int print_log(const char *sev, const char *fmt, ...)
-{
-   va_list ap;
-   time_t now = time(NULL);
-   char timestamp[128];
-   int res;
+   channel = PQescapeIdentifier(connection, argv[2], BUFSZ);
 
-   strftime(timestamp, sizeof timestamp, "%Y-%m-%dT%H:%M:%S", gmtime(&now));
-   res = fprintf(stderr, "%s - pg_listen - %s - ", timestamp, sev);
+   if (channel == NULL)
+   {
+      print_log("CRITICAL", PQerrorMessage(connection));
+      clean_and_exit(EXIT_FAILURE);
+   }
 
-   va_start(ap, fmt);
-   res += vfprintf(stderr, fmt, ap);
-   va_end(ap);
+   /* safe since argv[argc] == NULL by C99 5.1.2.2.1 */
+   listen_forever(connection, channel, argv[3], argv + 3);
 
-   return res + fprintf(stderr, "\n");
+   return EXIT_SUCCESS;
 }
